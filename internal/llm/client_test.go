@@ -92,8 +92,38 @@ func TestCleanJSON_NestedCodeFenceMarkers(t *testing.T) {
 
 // --- ExtractRecipes tests with httptest ---
 
-// chatResponse builds a minimal OpenAI-compatible chat completion JSON response.
-func chatResponse(content string) string {
+// toolCallResponse builds a minimal OpenAI-compatible chat completion JSON response
+// using a tool call (save_recipes).
+func toolCallResponse(recipesJSON string) string {
+	escaped, _ := json.Marshal(recipesJSON)
+	return fmt.Sprintf(`{
+		"id": "chatcmpl-test",
+		"object": "chat.completion",
+		"created": 1700000000,
+		"model": "test-model",
+		"choices": [{
+			"index": 0,
+			"message": {
+				"role": "assistant",
+				"content": null,
+				"tool_calls": [{
+					"id": "call_test",
+					"type": "function",
+					"function": {
+						"name": "save_recipes",
+						"arguments": %s
+					}
+				}]
+			},
+			"finish_reason": "stop"
+		}],
+		"usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+	}`, string(escaped))
+}
+
+// contentFallbackResponse builds a response with content but no tool calls,
+// to test the fallback path.
+func contentFallbackResponse(content string) string {
 	return fmt.Sprintf(`{
 		"id": "chatcmpl-test",
 		"object": "chat.completion",
@@ -108,7 +138,11 @@ func chatResponse(content string) string {
 			"finish_reason": "stop"
 		}],
 		"usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
-	}`, content)
+	}`, jsonString(content))
+}
+
+func newTestClient(serverURL string) *Client {
+	return New(serverURL+"/v1", "test-key", "test-model", 4096, "")
 }
 
 func testChunk() []pdf.Page {
@@ -117,11 +151,10 @@ func testChunk() []pdf.Page {
 	}
 }
 
-func TestExtractRecipes_Success(t *testing.T) {
-	recipesJSON := `[{"title":"Pasta Carbonara","ingredients":[{"name":"Spaghetti","quantity":"400","unit":"g"}],"preparation":["Boil water","Cook pasta"],"servings":4,"source_page":1}]`
+func TestExtractRecipes_ToolCall_Success(t *testing.T) {
+	toolArgs := `{"recipes":[{"title":"Pasta Carbonara","ingredients":[{"name":"Spaghetti","quantity":"400","unit":"g"}],"preparation":["Boil water","Cook pasta"],"servings":4,"source_page":1}]}`
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Verify request
 		if r.Method != http.MethodPost {
 			t.Errorf("expected POST, got %s", r.Method)
 		}
@@ -137,65 +170,110 @@ func TestExtractRecipes_Success(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, chatResponse(jsonString(recipesJSON)))
+		fmt.Fprint(w, toolCallResponse(toolArgs))
 	}))
 	defer server.Close()
 
-	client := New(server.URL+"/v1", "test-key", "test-model")
-	recipes, err := client.ExtractRecipes(context.Background(), testChunk(), "My Cookbook")
+	client := newTestClient(server.URL)
+	result, err := client.ExtractRecipes(context.Background(), testChunk(), "My Cookbook", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(recipes) != 1 {
-		t.Fatalf("expected 1 recipe, got %d", len(recipes))
+	if len(result.Recipes) != 1 {
+		t.Fatalf("expected 1 recipe, got %d", len(result.Recipes))
 	}
-	if recipes[0].Title != "Pasta Carbonara" {
-		t.Errorf("expected title 'Pasta Carbonara', got %q", recipes[0].Title)
+	if result.Recipes[0].Title != "Pasta Carbonara" {
+		t.Errorf("expected title 'Pasta Carbonara', got %q", result.Recipes[0].Title)
 	}
-	if recipes[0].SourceBook != "My Cookbook" {
-		t.Errorf("expected source book 'My Cookbook', got %q", recipes[0].SourceBook)
+	if result.Recipes[0].SourceBook != "My Cookbook" {
+		t.Errorf("expected source book 'My Cookbook', got %q", result.Recipes[0].SourceBook)
 	}
-	if recipes[0].SourcePage != 1 {
-		t.Errorf("expected source page 1, got %d", recipes[0].SourcePage)
+	if result.Recipes[0].SourcePage != 1 {
+		t.Errorf("expected source page 1, got %d", result.Recipes[0].SourcePage)
 	}
-	if len(recipes[0].Ingredients) != 1 {
-		t.Errorf("expected 1 ingredient, got %d", len(recipes[0].Ingredients))
+	if len(result.Recipes[0].Ingredients) != 1 {
+		t.Errorf("expected 1 ingredient, got %d", len(result.Recipes[0].Ingredients))
 	}
-	if recipes[0].Servings != 4 {
-		t.Errorf("expected servings 4, got %d", recipes[0].Servings)
+	if result.Recipes[0].Servings != 4 {
+		t.Errorf("expected servings 4, got %d", result.Recipes[0].Servings)
 	}
 }
 
-func TestExtractRecipes_EmptyResponse(t *testing.T) {
+func TestExtractRecipes_ToolCall_EmptyRecipes(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, chatResponse(jsonString("[]")))
+		fmt.Fprint(w, toolCallResponse(`{"recipes":[]}`))
 	}))
 	defer server.Close()
 
-	client := New(server.URL+"/v1", "test-key", "test-model")
-	recipes, err := client.ExtractRecipes(context.Background(), testChunk(), "My Cookbook")
+	client := newTestClient(server.URL)
+	result, err := client.ExtractRecipes(context.Background(), testChunk(), "My Cookbook", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(recipes) != 0 {
-		t.Fatalf("expected 0 recipes, got %d", len(recipes))
+	if len(result.Recipes) != 0 {
+		t.Fatalf("expected 0 recipes, got %d", len(result.Recipes))
 	}
 }
 
-func TestExtractRecipes_MalformedJSON(t *testing.T) {
+func TestExtractRecipes_ContentFallback_Success(t *testing.T) {
+	recipesJSON := `[{"title":"Test Recipe","ingredients":[{"name":"Flour","quantity":"200","unit":"g"}],"preparation":["Mix"]}]`
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, chatResponse(jsonString("this is not json at all")))
+		fmt.Fprint(w, contentFallbackResponse(recipesJSON))
 	}))
 	defer server.Close()
 
-	client := New(server.URL+"/v1", "test-key", "test-model")
-	_, err := client.ExtractRecipes(context.Background(), testChunk(), "My Cookbook")
+	client := newTestClient(server.URL)
+	result, err := client.ExtractRecipes(context.Background(), testChunk(), "My Cookbook", 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.Recipes) != 1 {
+		t.Fatalf("expected 1 recipe, got %d", len(result.Recipes))
+	}
+	if result.Recipes[0].Title != "Test Recipe" {
+		t.Errorf("expected title 'Test Recipe', got %q", result.Recipes[0].Title)
+	}
+}
+
+func TestExtractRecipes_ContentFallback_WithCodeFences(t *testing.T) {
+	recipesJSON := `[{"title":"Test Recipe","ingredients":[{"name":"Flour","quantity":"200","unit":"g"}],"preparation":["Mix"]}]`
+	wrappedJSON := "```json\n" + recipesJSON + "\n```"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, contentFallbackResponse(wrappedJSON))
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL)
+	result, err := client.ExtractRecipes(context.Background(), testChunk(), "My Cookbook", 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result.Recipes) != 1 {
+		t.Fatalf("expected 1 recipe, got %d", len(result.Recipes))
+	}
+	if result.Recipes[0].Title != "Test Recipe" {
+		t.Errorf("expected title 'Test Recipe', got %q", result.Recipes[0].Title)
+	}
+}
+
+func TestExtractRecipes_ContentFallback_MalformedJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, contentFallbackResponse("this is not json at all"))
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL)
+	_, err := client.ExtractRecipes(context.Background(), testChunk(), "My Cookbook", 1)
 	if err == nil {
 		t.Fatal("expected error for malformed JSON response")
 	}
-	if !strings.Contains(err.Error(), "parsing LLM response as JSON") {
+	if !strings.Contains(err.Error(), "parsing content as JSON") {
 		t.Fatalf("expected JSON parse error, got: %v", err)
 	}
 }
@@ -207,8 +285,8 @@ func TestExtractRecipes_APIError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := New(server.URL+"/v1", "test-key", "test-model")
-	_, err := client.ExtractRecipes(context.Background(), testChunk(), "My Cookbook")
+	client := newTestClient(server.URL)
+	_, err := client.ExtractRecipes(context.Background(), testChunk(), "My Cookbook", 1)
 	if err == nil {
 		t.Fatal("expected error for API failure")
 	}
@@ -231,8 +309,8 @@ func TestExtractRecipes_NoChoices(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := New(server.URL+"/v1", "test-key", "test-model")
-	_, err := client.ExtractRecipes(context.Background(), testChunk(), "My Cookbook")
+	client := newTestClient(server.URL)
+	_, err := client.ExtractRecipes(context.Background(), testChunk(), "My Cookbook", 1)
 	if err == nil {
 		t.Fatal("expected error for no choices")
 	}
@@ -241,38 +319,12 @@ func TestExtractRecipes_NoChoices(t *testing.T) {
 	}
 }
 
-func TestExtractRecipes_ResponseWithCodeFences(t *testing.T) {
-	recipesJSON := `[{"title":"Test Recipe","ingredients":[{"name":"Flour","quantity":"200","unit":"g"}],"preparation":["Mix"]}]`
-	wrappedJSON := "```json\n" + recipesJSON + "\n```"
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, chatResponse(jsonString(wrappedJSON)))
-	}))
-	defer server.Close()
-
-	client := New(server.URL+"/v1", "test-key", "test-model")
-	recipes, err := client.ExtractRecipes(context.Background(), testChunk(), "My Cookbook")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(recipes) != 1 {
-		t.Fatalf("expected 1 recipe, got %d", len(recipes))
-	}
-	if recipes[0].Title != "Test Recipe" {
-		t.Errorf("expected title 'Test Recipe', got %q", recipes[0].Title)
-	}
-}
-
 func TestExtractRecipes_SetsSourceBookOnAllRecipes(t *testing.T) {
-	recipesJSON := `[
-		{"title":"Recipe A","ingredients":[{"name":"A","quantity":"1"}],"preparation":["Do A"]},
-		{"title":"Recipe B","ingredients":[{"name":"B","quantity":"2"}],"preparation":["Do B"],"source_page":5}
-	]`
+	toolArgs := `{"recipes":[{"title":"Recipe A","ingredients":[{"name":"A","quantity":"1"}],"preparation":["Do A"]},{"title":"Recipe B","ingredients":[{"name":"B","quantity":"2"}],"preparation":["Do B"],"source_page":5}]}`
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, chatResponse(jsonString(recipesJSON)))
+		fmt.Fprint(w, toolCallResponse(toolArgs))
 	}))
 	defer server.Close()
 
@@ -281,50 +333,49 @@ func TestExtractRecipes_SetsSourceBookOnAllRecipes(t *testing.T) {
 		{Number: 4, Text: "text from page 4"},
 	}
 
-	client := New(server.URL+"/v1", "test-key", "test-model")
-	recipes, err := client.ExtractRecipes(context.Background(), chunk, "Great Cookbook")
+	client := newTestClient(server.URL)
+	result, err := client.ExtractRecipes(context.Background(), chunk, "Great Cookbook", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(recipes) != 2 {
-		t.Fatalf("expected 2 recipes, got %d", len(recipes))
+	if len(result.Recipes) != 2 {
+		t.Fatalf("expected 2 recipes, got %d", len(result.Recipes))
 	}
 	// Both should have SourceBook set
-	for i, r := range recipes {
+	for i, r := range result.Recipes {
 		if r.SourceBook != "Great Cookbook" {
 			t.Errorf("recipe %d: expected source book 'Great Cookbook', got %q", i, r.SourceBook)
 		}
 	}
 	// Recipe A has no source_page, should default to startPage (3)
-	if recipes[0].SourcePage != 3 {
-		t.Errorf("recipe 0: expected source page 3 (default from chunk start), got %d", recipes[0].SourcePage)
+	if result.Recipes[0].SourcePage != 3 {
+		t.Errorf("recipe 0: expected source page 3 (default from chunk start), got %d", result.Recipes[0].SourcePage)
 	}
 	// Recipe B has source_page=5, should keep it
-	if recipes[1].SourcePage != 5 {
-		t.Errorf("recipe 1: expected source page 5 (from LLM response), got %d", recipes[1].SourcePage)
+	if result.Recipes[1].SourcePage != 5 {
+		t.Errorf("recipe 1: expected source page 5 (from LLM response), got %d", result.Recipes[1].SourcePage)
 	}
 }
 
 func TestExtractRecipes_ContextCancelled(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Respond normally, but context should be cancelled before we get here
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, chatResponse(jsonString("[]")))
+		fmt.Fprint(w, toolCallResponse(`{"recipes":[]}`))
 	}))
 	defer server.Close()
 
-	client := New(server.URL+"/v1", "test-key", "test-model")
+	client := newTestClient(server.URL)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
 
-	_, err := client.ExtractRecipes(ctx, testChunk(), "My Cookbook")
+	_, err := client.ExtractRecipes(ctx, testChunk(), "My Cookbook", 1)
 	if err == nil {
 		t.Fatal("expected error for cancelled context")
 	}
 }
 
 func TestNew_ReturnsClient(t *testing.T) {
-	client := New("http://localhost:1234/v1", "key", "model")
+	client := New("http://localhost:1234/v1", "key", "model", 4096, "")
 	if client == nil {
 		t.Fatal("expected non-nil client")
 	}
